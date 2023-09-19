@@ -1,0 +1,364 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import rospy
+import os
+import json
+import numpy as np
+import random
+import time
+import sys
+sys.path.append(os.path.dirname(os.path.abspath(os.path.dirname(__file__))))
+from collections import deque
+from std_msgs.msg import Float32MultiArray,Float32
+import tf2_msgs.msg
+import geometry_msgs.msg
+from datetime import datetime
+#強化学習ライブラリ
+import pfrl
+import torch
+#使用自作ファイル
+from src.turtlebot3_dqn.environment_pytorch import Env #環境ファイル、状態取得
+
+import network #ネットワーク
+import my_explorer #探索手法
+
+class ReinforceAgent():
+    def __init__(self):
+        self.dirPath = os.path.dirname(os.path.realpath(__file__))
+        self.dirPath = self.dirPath.replace('turtlebot3_dqn/nodes', 'turtlebot3_dqn/save_model')
+        self.result = Float32MultiArray()
+
+        ########変更パラメータ#################################################################
+        self.mode = 'sim'#sim or real
+        self.gpu = -1 #ON:0,OFF:-1
+        self.task = 'goal' #goal or loop (タスク)
+        self.evaluation = True #テスト (save_modelにかかわらず各epi毎に重み保存)
+
+        self.save_model = False #重みとリプレイバッファを保存するか
+        self.save_episode = 5 #(↑True時)重み保存を開始するエピソード
+        self.load_model = False #保存した重みを適用するか
+        self.load_episode = 18 #(↑True時)適用する保存済重みのエピソード
+        self.load_rbuf = False #保存したリプレイバッファを学習に適用するか
+        self.input_list = ['cam','lidar'] #'cam','lidar','pastcam','pastlidar'
+        self.net = 'CNN' #CNN or MLP
+        self.Q_function = 'Dueling'  #MLP:[MLP], CNN:[Normal or Dueling or DistributionalDueling(for Rainbow)]
+        self.Model = 'DoubleDQN' #'DoubleDQN','CategoricalDoubleDQN(for Rainbow)'
+        self.noisy = False #noisynets for Rainbow
+        self.prioritized = False # prioritized for Rainbow
+        self.multistep = 2
+        self.opt = 'AdamW' #SGD, MomentumSGD, Adagrad, RMSprop, AdaDelta, Adam, AdamW
+        self.exploration = 'd_egreedy' #if not noisy #d_egreedy(decay_epsilon_greedy) or c_egreedy(constant_epsilon_greedy)
+        self.lidar_num = 12 #DQNの入力に使うlidar値の数
+        self.action_size = 3
+        self.episode = 16
+        self.eval_episode = 5
+        self.episode_step = 500
+        self.target_update = 500
+        self.discount_factor = 0.9
+        self.batch_size = 64
+        self.replay_start_size = 100 #初期探索
+        #######################################################################################
+
+        if self.gpu ==0:
+            torch.set_default_tensor_type('torch.cuda.FloatTensor')
+
+        if self.net == 'CNN':
+            self.n_added_input = 0
+            self.n_input_channels = 3
+            assert ('cam'in self.input_list) or ('pastcam'in self.input_list) , 'cam not in input_list' 
+            if 'pastcam' in self.input_list:
+                self.n_input_channels += 3
+            if ('lidar'in self.input_list) or ('pastlidar'in self.input_list):
+                self.n_added_input = self.lidar_num
+                if 'pastlidar' in self.input_list:
+                    self.n_added_input += self.lidar_num
+
+            if self.Q_function == 'Normal':
+                self.q_func = network.Q_Func(n_actions=self.action_size,n_input_channels=self.n_input_channels,n_added_input=self.n_added_input)
+            if self.Q_function == 'Dueling':
+                self.q_func = network.Dueling_Q_Func(n_actions=self.action_size,n_input_channels=self.n_input_channels,n_added_input=self.n_added_input)
+            #これがRainbow用
+            if self.Q_function == 'DistributionalDueling':
+                self.q_func = network.DistributionalDueling(n_actions=self.action_size,n_input_channels=self.n_input_channels,n_added_input=self.n_added_input)
+
+
+        if self.net == 'MLP':
+            self.n_input = 0
+            self.n_added_input=0
+            if ('cam'in self.input_list) or ('pastcam'in self.input_list):
+                self.n_input = 1296*3
+                if 'pastcam' in self.input_list:
+                    self.n_input += 1296*3
+            if ('lidar'in self.input_list) or ('pastlidar'in self.input_list):
+                self.n_added_input = self.lidar_num
+                if 'pastlidar' in self.input_list:
+                    self.n_added_input += self.lidar_num
+            self.q_func = network.MLP(n_actions=self.action_size,n_input=self.n_input,n_added_input=self.n_added_input)
+
+        #各optimizerの定義
+        # torch.optim.param_groups[0]['capturable'] = True
+        if self.opt == 'SGD':
+            self.optimizer = torch.optim.SGD(self.q_func.parameters(),lr=0.1,momentum=0)
+        if self.opt == 'MomentumSGD':
+            self.optimizer = torch.optim.SGD(self.q_func.parameters(),lr=0.1,momentum=0.9)
+        elif self.opt == 'Adagrad':
+            self.optimizer = torch.optim.Adagrad(self.q_func.parameters())
+        elif self.opt == 'RMSprop':
+            self.optimizer = torch.optim.RMSprop(self.q_func.parameters())
+        elif self.opt == 'Adadelta':
+            self.optimizer = torch.optim.Adadelta(self.q_func.parameters())
+        elif self.opt == 'Adam':
+            self.optimizer = torch.optim.Adam(self.q_func.parameters())
+        elif self.opt == 'AdamW':
+            self.optimizer = torch.optim.AdamW(self.q_func.parameters())
+        
+        #ノイズネットにしたい場合はここを使う
+        if self.noisy:
+            pfrl.nn.to_factorized_noisy(self.q_func,sigma_scale=0.5)
+        #noisy net だと学習時にgreedy にしたいので初期探索の時はいい感じにランダムに
+        #学習時にはgreedy になるようにしてます
+        if self.noisy:
+            self.explorer = my_explorer.MyEpsilonGreedy(
+                start_epsilon = 0.2,
+                end_epsilon = 0.0,
+                decay_steps = self.replay_start_size, #decay_stepsは減衰が終了するstep
+                random_action_func=lambda: np.random.randint(self.action_size),
+                replay_start_size = self.replay_start_size,
+                action_size = self.action_size
+            )
+
+        elif self.exploration == 'd_egreedy':
+            self.explorer = my_explorer.MyEpsilonGreedy(
+            start_epsilon = 0.2,
+            end_epsilon = 0.0,
+            decay_steps = self.episode*self.episode_step,
+            random_action_func=lambda: np.random.randint(self.action_size),
+            replay_start_size = self.replay_start_size,
+            action_size = self.action_size
+        )
+
+        elif self.exploration == 'c_egreedy':
+            self.explorer = my_explorer.MyConstantGreedy(
+                epsilon=0, #0ならgreedy
+                random_action_func=lambda: np.random.randint(self.action_size),
+                replay_start_size = 0,
+                # replay_start_size = self.replay_start_size, #初期探索を行う場合
+                action_size = self.action_size
+            )
+        
+        if self.prioritized:
+            update_interval=1
+            betasteps=1*10**4/update_interval
+            self.rbuf = pfrl.replay_buffers.PrioritizedReplayBuffer(
+                10**6,alpha=0.6,beta0=0.4,
+                betasteps=betasteps,
+                num_steps=self.multistep,
+                normalize_by_max="memory"
+                )
+        else:
+            self.rbuf = pfrl.replay_buffers.ReplayBuffer(capacity=10**5,num_steps=self.multistep)
+
+        if self.Model == 'DoubleDQN':
+            self.model = pfrl.agents.DoubleDQN(
+                self.q_func, optimizer=self.optimizer, replay_buffer=self.rbuf, gamma=self.discount_factor,
+                explorer=self.explorer,gpu=self.gpu,replay_start_size=self.replay_start_size,
+                minibatch_size=self.batch_size,update_interval=1,
+                target_update_interval=self.target_update,n_times_update=1
+            )
+        if self.Model == 'CategoricalDoubleDQN':
+            self.model = pfrl.agents.CategoricalDoubleDQN(
+                self.q_func, optimizer=self.optimizer, replay_buffer=self.rbuf,
+                gamma=self.discount_factor, explorer=self.explorer, gpu=self.gpu, minibatch_size=self.batch_size,
+                replay_start_size=self.replay_start_size,target_update_interval=self.target_update,
+                update_interval=1,batch_accumulator="mean"
+            )
+
+        if not self.load_model:
+            self.load_episode = 1
+
+def train(Set=0):
+    rospy.init_node('turtlebot3_pytorch')
+    
+    agent = ReinforceAgent()
+    env = Env(agent.mode,agent.input_list,agent.task)
+
+    if agent.load_model:
+        agent.model.load(agent.dirPath+'/'+'Ep'+str(Set)+'/'+str(agent.load_episode))
+    if agent.load_rbuf:
+        agent.rbuf.load(agent.dirPath+'/'+'Ep'+str(Set)+'/'+str(agent.load_episode)+'replay_buffer')
+ 
+    #########ファイル作成##########################################################
+    dt = datetime.now()
+    dtstr = dt.strftime('%Y%m%d_%H%M%S')
+    f_learning_file =  os.path.dirname(os.path.realpath(__file__)) + '/score/'
+    f_learning_name = f_learning_file + dtstr + '_learning_score.txt'
+    # ディレクトリがない場合、作成する
+    if not os.path.exists(f_learning_file):
+        os.makedirs(f_learning_file)
+    learning_column_names = ('Ep','score','goal','collision','time')
+    with open(f_learning_name, 'w') as f:
+        f.write('\t'.join(learning_column_names)+'\n')
+    ################################################################################
+
+    start_time = time.time()
+    if agent.mode == 'sim':
+        env.set_robot(0) #初期位置に移動、実機実験時は適用なし
+    for e in range(agent.load_episode, agent.episode+1):
+        goal = False
+        collision = False
+        env.flag = 'both' #エピソードおきにゴール初期化(検討中)
+        state = env.reset()
+        state = torch.from_numpy(state).float()
+        score = 0
+        goals = 0
+        collisions=0
+        goal_t = 0
+
+        for t in range(1,agent.episode_step+1):
+
+            if e*agent.episode_step<=agent.replay_start_size:#初期探索
+                env.flag = 'both'
+
+            action = agent.model.act(state)
+
+            goal_t+=1
+            next_state, reward, collision, goal = env.step(goal_t,action)
+            next_state = torch.from_numpy(next_state).float()
+
+            done=False
+            if goal:
+                goals += 1
+                goal = False
+                goal_t=0
+                done=True
+
+            elif collision:
+                collisions+=1
+                collision =False
+                done=True
+
+            agent.model.observe(next_state, reward, done, reset=False)
+
+            score += reward
+            state = next_state
+            
+            if t == agent.episode_step:
+                m, s = divmod(int(time.time() - start_time), 60)
+                h, m = divmod(m, 60)
+
+                rospy.loginfo('Ep: %d score: %.2f goal: %d collision: %d  time: %d:%02d:%02d', e, score, goals,collisions, h, m, s)
+                values = (e, score, goals, collisions)
+                times = (format(h,'d'),format(m,'02d'),format(s,'02d'))
+                with open(f_learning_name, 'a') as f:
+                    f.write('\t'.join(str(x) for x in values)+'\t'+':'.join(str(y) for y in times) +'\n')
+
+                break
+
+        if agent.save_model:
+            if e >= agent.save_episode:
+                agent.model.save(agent.dirPath+'/'+'Ep'+str(Set)+'/'+str(e))
+                agent.rbuf.save(agent.dirPath+'/'+'Ep'+str(Set)+'/'+str(e)+'replay_buffer')
+        if agent.evaluation:
+            agent.model.save(agent.dirPath+'/'+'Ep'+str(Set)+'/'+str(e))
+    print('train finish')
+    if agent.evaluation:
+        evaluate(Set,dtstr)
+        
+def evaluate(Set=0,dtstr=None):
+    rospy.init_node('turtlebot3_pytorch')
+    agent = ReinforceAgent()
+    env = Env(agent.mode,agent.input_list,agent.task)
+
+    #########ファイル作成##########################################################
+    if dtstr == None:
+        dt = datetime.now()
+        dtstr = dt.strftime('%Y%m%d_%H%M%S')
+    f_score_file =  os.path.dirname(os.path.realpath(__file__)) + '/score/'
+    f_score_name = f_score_file + dtstr + '_score.txt'
+    # ディレクトリがない場合、作成する
+    if not os.path.exists(f_score_file):
+        os.makedirs(f_score_file)
+    column_names = ('Ep','step(mean)','score(mean)','goal','collision')
+    with open(f_score_name, 'w') as f:
+        f.write('\t'.join(column_names)+'\n')
+    ################################################################################
+
+    print('test start')    
+
+    with agent.model.eval_mode():
+        for e in range(agent.load_episode, agent.episode+1):
+            t_list, score_list, goal_list, collision_list = [],[],[],[]
+            agent.model.load(agent.dirPath+'/'+'Ep'+str(Set)+'/'+str(e))
+
+            if e*agent.episode_step >=agent.replay_start_size:#初期探索終了後から
+            # if e == agent.episode: #最終結果について
+                for eval_e in range(1,agent.eval_episode+1):
+                    env.flag = 'both'
+                    if eval_e == 2:
+                        env.flag = 'blue'
+                    if eval_e == 3:
+                        env.flag = 'green'
+                    collision = False
+                    goal = False
+
+                    if agent.mode == 'sim':
+                        env.set_robot(eval_e) #毎回指定位置に設置
+                    else: #real
+                        while True:
+                            yn = input('set the robot(y/n)')
+                            if yn == 'y':
+                                break
+                    
+                    state = env.reset()            
+                    state = torch.from_numpy(state).float()
+                    score = 0
+                    goals = 0
+                    collisions=0
+                    for t in range(1,agent.episode_step+1):
+                        
+                        action = agent.model.act(state)
+
+                        next_state, reward, collision,goal = env.step(t,action,evaluate=True)
+                        next_state = torch.from_numpy(next_state).float()
+
+                        done=False
+                        if goal:
+                            goals+=1
+                            done = True
+
+                        elif collision:
+                            collisions+=1
+                            done = True
+                        
+                        elif t == agent.episode_step:
+                            done = True
+
+                        agent.model.observe(next_state, reward, done, reset=False)
+
+                        score += reward
+                        state = next_state
+
+                        if done:
+                            break
+                    t_list.append(t)
+                    score_list.append(score)
+                    goal_list.append(goals)
+                    collision_list.append(collisions)
+
+                t_list = np.asarray(t_list, dtype=np.float)
+                score_list = np.asarray(score_list, dtype=np.float)
+                goal_list = np.asarray(goal_list, dtype=np.float)
+                collision_list = np.asarray(collision_list, dtype=np.float)
+                rospy.loginfo('Ep: %d step(mean): %.2f score(mean): %.2f goal: %d collision: %d', e, t_list.mean(), score_list.mean(), goal_list.sum(),collision_list.sum())
+                values = (e, t_list.mean(), score_list.mean(), goal_list.sum(),collision_list.sum())
+                with open(f_score_name, 'a') as f:
+                    f.write('\t'.join(str(x) for x in values)+'\n')
+    print('test finish')
+
+if __name__ == '__main__':
+    for Set in range(3):
+        train(Set)
+
+    # train()
+    # evaluate()

@@ -1,1 +1,4 @@
 # senior_thesis
+turtlebot3_pytorch.py:/home/horiuchilab/catkin_ws/src/turtlebot3_machine_learning/turtlebot3_dqn/nodes/turtlebot3_pytorch
+environment_pytorch.py:/home/horiuchilab/catkin_ws/src/turtlebot3_machine_learning/turtlebot3_dqn/src/turtlebot3_dqn/environment_pytorch.py
+network.py:/home/horiuchilab/catkin_ws/src/turtlebot3_machine_learning/turtlebot3_dqn/nodes/network.py
